@@ -13,34 +13,60 @@ public class ResponsivePriorityQueue<T extends TimedMessage> implements Priority
 	private long timeout;
 	private AtomicInteger count = new AtomicInteger(0);
 	private volatile int segmentCount;
-	public volatile QueueNode<T> checkArray[];
 	public volatile QueueNode<T> scanArray[];
+	
+	private Object monitor = new Object();
 	private AtomicBoolean balancing = new AtomicBoolean(false);
-	
-	
+	private volatile QueueNode<T> onlineHead = new QueueNode<T>();
 	
 
 	public ResponsivePriorityQueue(int segmentCount, long timeout, double timeboost) {
 		this.segmentCount = segmentCount;
 		this.timeout = timeout;
 		this.timeBoost = timeboost;
-		checkArray = new QueueNode[segmentCount];
 		scanArray = new QueueNode[segmentCount];
 		for (int i = segmentCount-1;i>=0; i--) {
 			QueueNode<T> newNode = new QueueNode<T>(((double)i) / segmentCount, (i+1.0)/ segmentCount);
-			checkArray[i] = newNode;
+			newNode.id = i;
+			scanArray[i] = newNode;
 		}
-		System.arraycopy(checkArray, 0, scanArray, 0, segmentCount);
 	}
 
 	private static class QueueNode<T> {
-		ConcurrentLinkedQueue<T> queue;
+		
+		int id;
+		
+		volatile QueueNode<T> pre;
+		volatile QueueNode<T> next;
+		
+		AtomicBoolean active = new AtomicBoolean(false);
+		private ConcurrentLinkedQueue<T> queue;
 		double minPriority;
 		double maxPriority;
 		public QueueNode(double minPriority, double maxPriority) {
 			this.minPriority = minPriority;
 			this.maxPriority = maxPriority;
 			queue = new ConcurrentLinkedQueue<T>();
+		}
+		
+		public QueueNode(){}
+		
+		public boolean active(){
+			return active.get();
+		}
+		
+		public T poll(){
+			T t = queue.poll();
+			return t;
+		}
+		
+		public T peek(){
+			return queue.peek();
+		}
+		
+		public void offer(T t){
+			if(t==null) return;
+			queue.offer(t);
 		}
 	}
 
@@ -55,79 +81,143 @@ public class ResponsivePriorityQueue<T extends TimedMessage> implements Priority
 			throw new IllegalArgumentException();
 
 		if (begin == end - 1) {
-			if (checkArray[begin].minPriority <= priority && checkArray[begin].maxPriority > priority) {
-				return checkArray[begin];
+			if (scanArray[begin].minPriority <= priority && scanArray[begin].maxPriority > priority) {
+				return scanArray[begin];
 			} else {
 				return null;
 			}
 		} else {
 			int mid = (begin + end) / 2;
-			if (checkArray[mid].maxPriority <= priority) {
+			if (scanArray[mid].maxPriority <= priority) {
 				return getNode(priority, mid + 1, end);
-			} else if (checkArray[mid].minPriority > priority) {
+			} else if (scanArray[mid].minPriority > priority) {
 				return getNode(priority, begin, mid);
 			} else {
-				return checkArray[mid];
+				return scanArray[mid];
 			}
 		}
 	}
 
 	public boolean add(T e) {
 		QueueNode<T> node = getNode(e.getPrivority());
-		node.queue.add(e);
+		node.offer(e);
+		if(!node.active()){
+			synchronized(monitor){
+				if(!node.active()){
+					
+					if(onlineHead.next!=null){
+						node.pre = onlineHead;
+						node.next = onlineHead.next;
+						onlineHead.next.pre = node;
+						onlineHead.next = node;
+						balance();
+					}else{
+						onlineHead.next = node;
+						node.pre = onlineHead;
+						node.next = null;
+					}
+					
+					
+					node.active.compareAndSet(false, true);
+				}
+			}
+		}
 		return true;
 	}
+	public T poll() {
+		QueueNode<T> node = onlineHead.next;
+		
+		T t = node.poll();
+		if(t==null){
+			synchronized (monitor) {
+				
+				if(node.active.get()){
+					//remove from the online list
+					if(node.next!=null){
+						node.next.pre = node.pre;
+					}
+					node.pre.next = node.next;
+					
+					node.next = null; //since there are always a non use head, so there is no need to point it to null;
+					node.active.set(false);
+					
+					//balance();
+					if(onlineHead.next == null){
+						return null;
+					}
+				}
+				
+			}
+			return poll();
+		}else{
+			if(node.next!=null&&caculate(node.next.peek())>caculate(t)){
+				balance();
+			}
+		}
+		
+		return t;
+	}
+	
+	public T peek() {
+		return null;
+	}
+	
 
 	private double caculate(T e) {
 		if (e == null) {
 			return 0;
 		}
 		return e.getPrivority() + timeBoost * (System.currentTimeMillis() - e.getTime()) / timeout;
+		//return e.getPrivority();
 	}
 	
 	private void balance() {
-		long time = System.currentTimeMillis();
-		if(balancing.compareAndSet(false, true)){
-			for(int i=0;i<scanArray.length-1;i++){
-				if(!compare(scanArray[i], scanArray[i+1])){
-					QueueNode<T> t = scanArray[i];
-					scanArray[i] = scanArray[i+1];
-					scanArray[i+1] = t;
-				}else{
-					break;
+		if(!balancing.get()){
+			if(balancing.compareAndSet(false, true)){
+				synchronized (monitor) {
+					QueueNode<T> c = onlineHead.next,p=c,n = p.next;
+					
+					if(c==null||n==null) return;
+					
+					while(true&&n!=null){
+						if(compare(c,n)){
+							break;
+						}
+						p = n;
+						n = p.next;
+						
+					}
+					
+					if(c.next != n){
+						//delete c and insert it between n and n.next
+						onlineHead.next = c.next;
+						c.next.pre = onlineHead;
+						
+						c.pre = p;
+						p.next = c;
+						c.next = n;
+						if(n!=null){
+							n.pre = c;
+						}
+					}
+					balancing.set(false);
 				}
 			}
-			balancing.compareAndSet(true,false);
-			System.out.println("balance time"+(System.currentTimeMillis()-time));
 		}
+		
 	}
 	
 	private boolean compare(QueueNode<T> a,QueueNode<T> b){
 		if(a==null){
 			return false;
 		}
-		if(b ==null){
+		if(b == null){
 			return true;
 		}
-		if(caculate(a.queue.peek())>caculate(b.queue.peek())){
-			return true;
-		}
-		return false;
+		return caculate(a.peek()) > caculate(b.peek());
 	}
-
-
-	public T peek() {
-		T t = scanArray[0].queue.peek();
-		if(t == null){
-			for(int i=0;i<segmentCount;i++){
-				t = scanArray[i].queue.poll();
-				if(t != null){
-					break;
-				}
-			}
-		}
-		return t;
-	}
+	
+	
 
 	public int size() {
 		return count.get();
@@ -138,28 +228,16 @@ public class ResponsivePriorityQueue<T extends TimedMessage> implements Priority
 	}
 
 	public void clear() {
-		for (int i = 0; i < checkArray.length; i++) {
-			checkArray[i].queue.clear();
+		for (int i = 0; i < scanArray.length; i++) {
+			scanArray[i].queue.clear();
 		}
 	}
 
-	public T poll() {
-		T t = scanArray[0].queue.poll();
-		if(t == null){
-			for(int i=0;i<segmentCount;i++){
-				t = scanArray[i].queue.poll();
-				if(t != null){
-					break;
-				}
-			}
-		}
-		balance();
-		return t;
-	}
+	
 
 	public static void main(String[] args) {
-		ResponsivePriorityQueue<TimedMessage> queue = new ResponsivePriorityQueue<TimedMessage>(10, 10000000, 1.0);
-
+		ResponsivePriorityQueue<TimedMessage> queue = new ResponsivePriorityQueue<TimedMessage>(10, 10000, 1.0);
+		
 		for (int i = 1; i <= 1000; i++) {
 
 			try {
@@ -168,11 +246,13 @@ public class ResponsivePriorityQueue<T extends TimedMessage> implements Priority
 			}
 			System.out.println("add");
 			queue.add(new TimedMessage() {
-
+				{
+					p = Math.random();
+				}
 				private long time = System.currentTimeMillis();
-
+				private double p;
 				public double getPrivority() {
-					return Math.random();
+					return p;
 				}
 
 				public long getTime() {
@@ -181,9 +261,9 @@ public class ResponsivePriorityQueue<T extends TimedMessage> implements Priority
 			});
 		}
 
-		for (int i = 0; i < queue.checkArray.length; i++) {
-			System.out.println("queue:" + i + " priority:" + queue.checkArray[i].maxPriority + "--- "
-					+ queue.checkArray[i].queue.size());
+		for (int i = 0; i < queue.scanArray.length; i++) {
+			System.out.println("queue:" + i + " priority:" + queue.scanArray[i].maxPriority + "--- "
+					+ queue.scanArray[i].queue.size());
 		}
 
 		System.out.println("continue ?");
@@ -200,14 +280,10 @@ public class ResponsivePriorityQueue<T extends TimedMessage> implements Priority
 			c++;
 			if(c%10 == 0){
 				System.out.println("--------------------------");
-				for (int i = 0; i < queue.checkArray.length; i++) {
-					System.out.println("queue:" + i + " priority:" + queue.checkArray[i].maxPriority + "--- "
-							+ queue.checkArray[i].queue.size());
+				for (int i = 0; i < queue.scanArray.length; i++) {
+					System.out.println("queue:" + i + " priority:" + queue.scanArray[i].maxPriority + "--- "
+							+ queue.scanArray[i].queue.size());
 				}
-			}
-			try {
-				TimeUnit.MILLISECONDS.sleep(10);
-			} catch (InterruptedException e) {
 			}
 		} while (t != null);
 
